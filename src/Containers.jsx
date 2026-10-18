@@ -28,6 +28,7 @@ import ContainerCheckpointModal from './ContainerCheckpointModal.jsx';
 import ContainerCommitModal from './ContainerCommitModal.jsx';
 import ContainerDeleteModal from './ContainerDeleteModal.jsx';
 import ContainerDetails from './ContainerDetails.jsx';
+import ContainerDomains from './ContainerDomains.jsx';
 import ContainerHealthLogs from './ContainerHealthLogs.jsx';
 import ContainerIntegration, { renderContainerPublishedPorts, renderContainerVolumes } from './ContainerIntegration.jsx';
 import ContainerLogs from './ContainerLogs.jsx';
@@ -535,6 +536,11 @@ class Containers extends React.Component {
                     name: _("Integration"),
                     renderer: ContainerIntegration,
                     data: { container, localImages }
+                });
+                tabs.push({
+                    name: _("Domains"),
+                    renderer: ContainerDomains,
+                    data: { container }
                 });
                 tabs.push({
                     name: _("Logs"),
