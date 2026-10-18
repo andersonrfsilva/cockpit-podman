@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Opt-in Linux smoke with externally provisioned fixtures; never downloads images."""
+
+import http.client
+import importlib.util
+import json
+import os
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, TypeVar
+from urllib.parse import urlsplit
+
+_T = TypeVar("_T")
+spec = importlib.util.spec_from_file_location("traefik", Path(__file__).resolve().parents[1] / "src/traefik.py")
+assert spec is not None and spec.loader is not None
+traefik: Any = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(traefik)
+run = traefik.command
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def eventually(check: Callable[[], _T]) -> _T:
+    deadline = time.monotonic() + 25
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            return check()
+        except (AssertionError, OSError, http.client.HTTPException) as error:
+            last = error
+            time.sleep(0.2)
+    raise AssertionError("Timed out waiting for Traefik: " + repr(last))
+
+
+def main() -> None:
+    proxy_image = os.environ.get("TRAEFIK_IMAGE", "docker.io/library/traefik:v3.6.25")
+    application_image = "docker.io/library/python:3.13-alpine"
+    for image in (proxy_image, application_image):
+        if subprocess.run(["podman", "image", "exists", image], check=False).returncode:
+            raise SystemExit("Preinstall this test image manually before running the smoke: " + image)
+    tag = "cockpit-traefik-test-" + uuid.uuid4().hex[:10]
+    traefik.NETWORK = tag
+    traefik.PROXY = tag + "-proxy"
+    application, other_application = tag + "-app", tag + "-other"
+    http_port, https_port = free_port(), free_port()
+    while https_port == http_port:
+        https_port = free_port()
+    with tempfile.TemporaryDirectory(prefix=tag) as directory:
+        root = Path(directory)
+        manager = traefik.Manager(root, {})
+        for name in ("dynamic", "certs"):
+            (root / name).mkdir()
+        route = {
+            "host": "smoke.test",
+            "port": 8000,
+            "path": "/public",
+            "internal_path": "/inside",
+            "strip_path": True,
+            "enabled": True,
+            "tls": "http",
+        }
+        assert not manager.status()["ready"]
+        try:
+            manager.save({"container": application, "route": route})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Missing external Traefik was accepted")
+        assert not (root / "cockpit-podman-state.json").exists()
+        assert not (root / "certs/cockpit-podman").exists()
+        for kind, name in (("container", traefik.PROXY), ("network", tag)):
+            assert subprocess.run(["podman", kind, "exists", name], check=False).returncode == 1
+        print("PASS missing prerequisites do not install or create a proxy, network or routing state", flush=True)
+
+        # Fixture preparation represents the administrator, not the integration.
+        static = {
+            "entryPoints": {"web": {"address": ":80"}, "websecure": {"address": ":443"}},
+            "providers": {"file": {"directory": "/etc/traefik/dynamic", "watch": True}},
+        }
+        traefik.atomic_json(root / "traefik.json", static)
+        (root / "acme.json").write_text("operator-owned ACME storage\n")
+        (root / "certs/operator.key").write_text("operator-owned key\n")
+        operator_config = {
+            "http": {
+                "routers": {
+                    "operator": {"rule": "Host(`operator.test`)", "entryPoints": ["web"], "service": "operator"}
+                },
+                "services": {"operator": {"loadBalancer": {"servers": [{"url": "http://" + application + ":8000"}]}}},
+            }
+        }
+        traefik.atomic_json(root / "dynamic/operator.yml", operator_config)
+        preserved = {
+            path: path.read_bytes()
+            for path in (
+                root / "traefik.json",
+                root / "acme.json",
+                root / "certs/operator.key",
+                root / "dynamic/operator.yml",
+            )
+        }
+        (root / "server.py").write_text(
+            "import http.server,json\n"
+            "class Handler(http.server.BaseHTTPRequestHandler):\n"
+            " def do_GET(self):\n"
+            '  payload = dict(path=self.path, host=self.headers.get("Host"),\n'
+            '                 proto=self.headers.get("X-Forwarded-Proto"))\n'
+            "  self.send_response(200); self.end_headers()\n"
+            "  self.wfile.write(json.dumps(payload).encode())\n"
+            'http.server.HTTPServer(("0.0.0.0",8000),Handler).serve_forever()\n'
+        )
+        run(
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-keyout",
+            str(root / "test.key"),
+            "-out",
+            str(root / "test.crt"),
+            "-subj",
+            "/CN=smoke.test",
+            "-addext",
+            "subjectAltName=DNS:smoke.test,IP:127.0.0.1",
+        )
+        context = ssl.create_default_context(cafile=str(root / "test.crt"))
+
+        def fetch(
+            path: str = "/public/hello", *, secure: bool = False, host: str = "smoke.test", expected: int = 200
+        ) -> tuple[bytes, dict[str, str]]:
+            connection = http.client.HTTPConnection("127.0.0.1", https_port if secure else http_port, timeout=3)
+            if secure:
+                connection.sock = context.wrap_socket(
+                    socket.create_connection(("127.0.0.1", https_port), timeout=3), server_hostname="smoke.test"
+                )
+            try:
+                connection.request("GET", path, headers={"Host": host})
+                response = connection.getresponse()
+                body = response.read()
+                assert response.status == expected, (response.status, body)
+                return body, dict(response.getheaders())
+            finally:
+                connection.close()
+
+        try:
+            run("podman", "network", "create", tag)
+            run(
+                "podman",
+                "run",
+                "--pull=never",
+                "--detach",
+                "--name",
+                application,
+                "--network",
+                "bridge",
+                "--volume",
+                str(root / "server.py") + ":/server.py:ro,z",
+                application_image,
+                "python",
+                "/server.py",
+            )
+            run(
+                "podman",
+                "run",
+                "--pull=never",
+                "--detach",
+                "--name",
+                traefik.PROXY,
+                "--network",
+                tag,
+                "--publish",
+                "127.0.0.1:" + str(http_port) + ":80",
+                "--publish",
+                "127.0.0.1:" + str(https_port) + ":443",
+                "--volume",
+                str(root / "traefik.json") + ":/etc/traefik/traefik.json:ro,Z",
+                "--volume",
+                str(root / "dynamic") + ":/etc/traefik/dynamic:ro,Z",
+                "--volume",
+                str(root / "certs") + ":/etc/traefik/certs:ro,Z",
+                proxy_image,
+                "--configFile=/etc/traefik/traefik.json",
+            )
+            assert manager.status()["ready"]
+            proxy_id = run("podman", "inspect", "--format", "{{.Id}}", traefik.PROXY)
+            started_at = run("podman", "inspect", "--format", "{{.State.StartedAt}}", traefik.PROXY)
+            print(
+                "PASS an operator-installed proxy and network are accepted without Cockpit ownership labels",
+                flush=True,
+            )
+
+            reserved = root / "dynamic/cockpit-podman.yml"
+            reserved.write_text("{}\n")
+            try:
+                manager.save({"container": application, "route": route})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Unowned routing file was overwritten")
+            assert reserved.read_text() == "{}\n"
+            reserved.unlink()
+            print("PASS existing unowned configuration is not overwritten", flush=True)
+
+            manager.save({"container": application, "route": route})
+            key = traefik.route_id(route)
+            payload = json.loads(eventually(lambda: fetch()[0]))
+            assert payload == {"path": "/inside/hello", "host": "smoke.test", "proto": "http"}, payload
+            eventually(lambda: fetch(host="unknown.test", expected=404))
+            eventually(lambda: fetch(host="operator.test"))
+            print("PASS HTTP routing, private networking, Host preservation and ordered strip/add prefix", flush=True)
+
+            run(
+                "podman",
+                "run",
+                "--pull=never",
+                "--detach",
+                "--name",
+                other_application,
+                "--network",
+                "bridge",
+                "--volume",
+                str(root / "server.py") + ":/server.py:ro,z",
+                application_image,
+                "python",
+                "/server.py",
+            )
+            other_route = dict(route, host="other.test", internal_path="/second")
+            manager.save({"container": other_application, "route": other_route})
+
+            def second_backend() -> None:
+                payload = json.loads(fetch(host="other.test")[0])
+                assert payload == {"path": "/second/hello", "host": "other.test", "proto": "http"}, payload
+
+            eventually(second_backend)
+            manager.delete({"id": traefik.route_id(other_route), "container": other_application})
+            root_route = dict(route, path="/", internal_path="/", strip_path=False)
+            manager.save({"container": application, "route": root_route})
+
+            def precedence() -> None:
+                assert json.loads(fetch()[0])["path"] == "/inside/hello"
+
+            eventually(precedence)
+            manager.delete({"id": traefik.route_id(root_route), "container": application})
+            try:
+                manager.save({"container": other_application, "route": route})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Duplicate route accepted")
+            print("PASS multiple applications share one proxy, route specificity and duplicate rejection", flush=True)
+
+            route["tls"] = "certificate"
+            manager.save({
+                "id": key,
+                "container": application,
+                "route": route,
+                "certificate": (root / "test.crt").read_text(),
+                "private_key": (root / "test.key").read_text(),
+            })
+
+            def redirect() -> None:
+                _, headers = fetch(expected=301)
+                target = urlsplit(headers["Location"])
+                assert (target.scheme, target.hostname, target.port or 443, target.path) == (
+                    "https",
+                    "smoke.test",
+                    443,
+                    "/public/hello",
+                ), headers
+
+            eventually(redirect)
+            payload = json.loads(eventually(lambda: fetch(secure=True)[0]))
+            assert payload == {"path": "/inside/hello", "host": "smoke.test", "proto": "https"}, payload
+            private_key = root / "certs/cockpit-podman" / (key + ".key")
+            assert private_key.stat().st_mode & 0o777 == 0o600
+            print("PASS HTTPS redirect, trusted PEM TLS and private-key permissions", flush=True)
+
+            route["enabled"] = False
+            manager.save({"id": key, "container": application, "route": route})
+            eventually(lambda: fetch(secure=True, expected=404))
+            route["enabled"] = True
+            manager.save({"id": key, "container": application, "route": route})
+            eventually(lambda: fetch(secure=True))
+            run("podman", "restart", application)
+            eventually(lambda: fetch(secure=True))
+            manager.delete({"id": key, "container": application})
+            eventually(lambda: fetch(expected=404))
+            eventually(lambda: fetch(host="operator.test"))
+            assert key not in manager.state()["routes"] and not private_key.exists()
+            assert run("podman", "inspect", "--format", "{{.Id}}", traefik.PROXY) == proxy_id
+            assert run("podman", "inspect", "--format", "{{.State.StartedAt}}", traefik.PROXY) == started_at
+            for path, content in preserved.items():
+                assert path.read_bytes() == content, path
+            print(
+                "PASS route lifecycle preserves the running proxy, operator routes, static config, ACME and keys",
+                flush=True,
+            )
+
+            run("podman", "stop", traefik.PROXY)
+            status = manager.status()
+            assert not status["ready"] and not status["running"]
+            assert run("podman", "inspect", "--format", "{{.State.Running}}", traefik.PROXY).strip() == "false"
+            print("PASS a stopped external proxy is not started automatically", flush=True)
+        except Exception:
+            for container in (traefik.PROXY, application):
+                logs = subprocess.run(["podman", "logs", container], text=True, capture_output=True, check=False)
+                print(container, logs.stdout, logs.stderr, flush=True)
+            raise
+        finally:
+            for container in (traefik.PROXY, application, other_application):
+                subprocess.run(["podman", "rm", "--force", container], capture_output=True, check=False)
+            subprocess.run(["podman", "network", "rm", tag], capture_output=True, check=False)
+            print("Removed test fixtures; preinstalled images and the host proxy were not changed", flush=True)
+
+
+if __name__ == "__main__":
+    main()

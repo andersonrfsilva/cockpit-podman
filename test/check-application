@@ -3694,6 +3694,48 @@ ContainerName=guitarq1
             b.wait_in_text(f"{sel} + tr", "sleep infinity")
             b.wait_not_in_text(f"{sel} + tr", "systemd service")
 
+    def testDomainConfiguration(self) -> None:
+        m = self.machine
+        b = self.browser
+        m.execute(f"podman run -d --name domain-app {IMG_ALPINE} sleep infinity")
+        container_id = m.execute("podman inspect --format '{{.Id}}' domain-app").strip()
+        self.login()
+        self.toggleExpandedContainer("domain-app")
+        b.click(".pf-m-expanded button:contains('Domains')")
+        prefix = f"#domains-{container_id}"
+        form = f"{self.getContainerSelector('domain-app')} + tr form"
+
+        # A missing Traefik is a prerequisite failure: saving stays disabled and the draft survives.
+        b.wait_visible(prefix + "-host")
+        b.set_input_text(prefix + "-host", "app.example.com")
+        b.set_input_text(prefix + "-port", "8080")
+        b.set_input_text(prefix + "-path", "/public")
+        b.set_input_text(prefix + "-internal_path", "/internal")
+        b.wait_visible(form + " button[type=submit]:disabled")
+        details = f"{self.getContainerSelector('domain-app')} + tr"
+        b.wait_in_text(details, "Traefik prerequisites not met")
+        b.click(details + " button:contains('Refresh prerequisites')")
+        b.wait_val(prefix + "-host", "app.example.com")
+        b.wait_visible(form + " button[type=submit]:disabled")
+
+        # Let's Encrypt uses the existing resolver; certificate fields remain available.
+        b.set_val(prefix + "-tls", "letsencrypt")
+        b.wait_in_text(form, "Use the existing Let's Encrypt resolver")
+        b.set_val(prefix + "-tls", "certificate")
+        b.wait_visible(prefix + "-cert")
+        b.wait_visible(prefix + "-key")
+        m.execute("test ! -e /var/lib/cockpit-traefik/cockpit-podman-state.json")
+
+        # Rootless owners cannot create another proxy on the same host ports.
+        self.execute(f"podman run -d --name user-domain-app {IMG_ALPINE} sleep infinity", system=False)
+        self.toggleExpandedContainer("domain-app")
+        self.waitContainerRow("user-domain-app")
+        self.toggleExpandedContainer("user-domain-app", system=False)
+        b.click(".pf-m-expanded button:contains('Domains')")
+        details = f"{self.getContainerSelector('user-domain-app', system=False)} + tr"
+        b.wait_in_text(details, "no separate proxy will be created")
+        b.wait_not_present(details + " form")
+
 
 if __name__ == '__main__':
     testlib.test_main()

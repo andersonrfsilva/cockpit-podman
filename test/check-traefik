@@ -1,0 +1,496 @@
+#!/usr/bin/python3 -cimport os, sys; os.execv(os.path.dirname(sys.argv[1]) + "/common/pywrap", sys.argv)
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+import importlib.util
+import json
+import stat
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any, Optional
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("traefik", Path(__file__).resolve().parents[1] / "src/traefik.py")
+assert spec is not None and spec.loader is not None
+traefik: Any = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(traefik)
+
+
+class TestTraefikValidation(unittest.TestCase):
+    def testHostnameNormalization(self) -> None:
+        route = traefik.route_value({"host": "BÜCHER.example."})
+        self.assertEqual(route["host"], "xn--bcher-kva.example")
+
+    def testIdna2003AlteredHostnameRejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "punycode"):
+            traefik.route_value({"host": "straße.de"})
+
+    def testPunycodeHostnameAccepted(self) -> None:
+        self.assertEqual(traefik.route_value({"host": "xn--strae-oqa.de"})["host"], "xn--strae-oqa.de")
+
+    def testInvalidHostnames(self) -> None:
+        host: Any
+        for host in (
+            "",
+            "https://app.example",
+            "app.example:80",
+            "*.example",
+            "-app.example",
+            "app..example",
+            "a" * 64 + ".example",
+            "app`example",
+            "a." * 127 + "example",
+            None,
+            42,
+            [],
+        ):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                traefik.route_value({"host": host})
+
+    def testPortBoundaries(self) -> None:
+        for value in (1, "1", 65535, "65535"):
+            with self.subTest(port=value):
+                self.assertEqual(traefik.port(value), int(value))
+        for invalid in (0, 65536, -1, True, False, None, 80.0, "1e2", "\uff18\uff10", "80/tcp"):
+            with self.subTest(port=invalid), self.assertRaises(ValueError):
+                traefik.port(invalid)
+
+    def testUnsafePaths(self) -> None:
+        path: Any
+        for key in ("path", "internal_path"):
+            for path in ("relative", "/a?b", "/a#b", "/a b", "/a\\b", "/a\nb", "/a`b", "/a\x00b", None, [], 0):
+                with self.subTest(key=key, path=path), self.assertRaises(ValueError):
+                    traefik.route_value({"host": "app.example", key: path})
+
+    def testBooleanAndTLSValidation(self) -> None:
+        for key in ("enabled", "strip_path"):
+            for value in ("false", 0, 1, None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    traefik.route_value({"host": "app.example", key: value})
+        with self.assertRaises(ValueError):
+            traefik.route_value({"host": "app.example", "tls": "unknown"})
+
+    def testPrivateFileReplacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.key"
+            path.write_text("previous key")
+            path.chmod(0o644)
+            traefik.atomic_text(path, "replacement key")
+            self.assertEqual(path.read_text(), "replacement key")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def testFailedReplacementPreservesDestination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination"
+            destination.mkdir()
+            existing = destination / "existing"
+            existing.write_text("preserve")
+            with self.assertRaises(OSError):
+                traefik.atomic_text(destination, "replacement")
+            self.assertEqual(existing.read_text(), "preserve")
+            self.assertEqual(list(Path(directory).glob(".cockpit-*")), [])
+
+
+class TestDynamicConfig(unittest.TestCase):
+    def route(self, **value: Any) -> tuple[str, dict[str, Any]]:
+        route = traefik.route_value(dict({"host": "app.example", "port": 8080}, **value))
+        route["container"] = "app"
+        return traefik.route_id(route), route
+
+    def testEmpty(self) -> None:
+        self.assertEqual(traefik.dynamic_config({}), {})
+
+    def testHttpRoot(self) -> None:
+        key, route = self.route()
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "http": {
+                    "routers": {
+                        key: {
+                            "rule": "Host(`app.example`)",
+                            "service": key,
+                            "entryPoints": ["web"],
+                            "middlewares": [],
+                        }
+                    },
+                    "services": {
+                        key: {"loadBalancer": {"servers": [{"url": "http://app:8080"}], "passHostHeader": True}}
+                    },
+                }
+            },
+        )
+
+    def testStripThenAdd(self) -> None:
+        key, route = self.route(path="/public", internal_path="/inside", strip_path=True)
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "http": {
+                    "routers": {
+                        key: {
+                            "rule": "Host(`app.example`) && PathPrefix(`/public`)",
+                            "service": key,
+                            "entryPoints": ["web"],
+                            "middlewares": [key + "-strip", key + "-add"],
+                        }
+                    },
+                    "services": {
+                        key: {"loadBalancer": {"servers": [{"url": "http://app:8080"}], "passHostHeader": True}}
+                    },
+                    "middlewares": {
+                        key + "-strip": {"stripPrefix": {"prefixes": ["/public"]}},
+                        key + "-add": {"addPrefix": {"prefix": "/inside"}},
+                    },
+                }
+            },
+        )
+
+    def testAddWithoutStrip(self) -> None:
+        key, route = self.route(path="/api", internal_path="/x", strip_path=False)
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "http": {
+                    "routers": {
+                        key: {
+                            "rule": "Host(`app.example`) && PathPrefix(`/api`)",
+                            "service": key,
+                            "entryPoints": ["web"],
+                            "middlewares": [key + "-add"],
+                        }
+                    },
+                    "services": {
+                        key: {"loadBalancer": {"servers": [{"url": "http://app:8080"}], "passHostHeader": True}}
+                    },
+                    "middlewares": {key + "-add": {"addPrefix": {"prefix": "/x"}}},
+                }
+            },
+        )
+
+    def testSameInternalPathNoAdd(self) -> None:
+        key, route = self.route(path="/api", internal_path="/api")
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "http": {
+                    "routers": {
+                        key: {
+                            "rule": "Host(`app.example`) && PathPrefix(`/api`)",
+                            "service": key,
+                            "entryPoints": ["web"],
+                            "middlewares": [],
+                        }
+                    },
+                    "services": {
+                        key: {"loadBalancer": {"servers": [{"url": "http://app:8080"}], "passHostHeader": True}}
+                    },
+                }
+            },
+        )
+
+    def testLetsEncrypt(self) -> None:
+        key, route = self.route(tls="letsencrypt")
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "http": {
+                    "routers": {
+                        key: {
+                            "rule": "Host(`app.example`)",
+                            "service": key,
+                            "entryPoints": ["websecure"],
+                            "middlewares": [],
+                            "tls": {"certResolver": "letsencrypt"},
+                        },
+                        key + "-http": {
+                            "rule": "Host(`app.example`)",
+                            "service": key,
+                            "entryPoints": ["web"],
+                            "middlewares": [key + "-redirect"],
+                        },
+                    },
+                    "services": {
+                        key: {"loadBalancer": {"servers": [{"url": "http://app:8080"}], "passHostHeader": True}}
+                    },
+                    "middlewares": {key + "-redirect": {"redirectScheme": {"scheme": "https", "permanent": True}}},
+                }
+            },
+        )
+
+    def testCertificateDisabledKeepsCertificate(self) -> None:
+        key, route = self.route(tls="certificate", enabled=False)
+        self.assertEqual(
+            traefik.dynamic_config({key: route}),
+            {
+                "tls": {
+                    "certificates": [
+                        {
+                            "certFile": "/etc/traefik/certs/cockpit-podman/" + key + ".crt",
+                            "keyFile": "/etc/traefik/certs/cockpit-podman/" + key + ".key",
+                        }
+                    ]
+                }
+            },
+        )
+
+
+class TestManagerState(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        for name in ("dynamic", "certs"):
+            (self.root / name).mkdir()
+        patches = [
+            mock.patch.object(traefik.os, "geteuid", return_value=0),
+            mock.patch.object(traefik.Manager, "status", return_value={"ready": True, "prerequisites": []}),
+            mock.patch.object(traefik, "command", side_effect=self.fake_command),
+            mock.patch.object(traefik, "unsafe_directory", return_value=None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.connected: list[tuple[str, ...]] = []
+        self.manager = traefik.Manager(self.root, {})
+
+    def fake_command(self, *args: str) -> str:
+        if args[:4] == ("podman", "container", "inspect", "--"):
+            name = args[4]
+            return json.dumps(
+                [
+                    {
+                        "Id": "id-" + name,
+                        "Name": name,
+                        "HostConfig": {"NetworkMode": "bridge"},
+                        "NetworkSettings": {"Networks": {"podman": {}}},
+                    }
+                ]
+            )
+        if args[:3] == ("podman", "network", "connect"):
+            self.connected.append(args)
+            return ""
+        raise AssertionError(args)
+
+    def request(self, container: str = "app", route_id: Optional[str] = None, **route: Any) -> dict[str, Any]:
+        request: dict[str, Any] = {"container": container, "route": dict({"host": "a.example"}, **route)}
+        if route_id:
+            request["id"] = route_id
+        return request
+
+    def saved(self, **route: Any) -> str:
+        self.manager.save(self.request(**route))
+        (key,) = self.manager.state()["routes"]
+        return str(key)
+
+    def testSaveWritesStateAndOwnedConfig(self) -> None:
+        self.manager.save(self.request())
+        text = (self.root / "dynamic/cockpit-podman.yml").read_text()
+        self.assertTrue(text.startswith(traefik.CONFIG_HEADER))
+        state = self.manager.state()
+        self.assertEqual(json.loads(text[len(traefik.CONFIG_HEADER) :]), traefik.dynamic_config(state["routes"]))
+        self.assertEqual(len(state["routes"]), 1)
+        self.assertEqual(next(iter(state["routes"].values()))["container"], "app")
+        self.assertEqual(self.connected, [("podman", "network", "connect", "cockpit-traefik", "id-app")])
+
+    def testDuplicateRejected(self) -> None:
+        self.saved()
+        before = self.manager.state()
+        with self.assertRaises(ValueError):
+            self.manager.save(self.request(container="other"))
+        self.assertEqual(self.manager.state(), before)
+
+    def testEditMovesKey(self) -> None:
+        old = self.saved()
+        self.manager.save(self.request(route_id=old, path="/v2"))
+        routes = self.manager.state()["routes"]
+        self.assertNotIn(old, routes)
+        self.assertEqual(
+            list(routes), [traefik.route_id(traefik.route_value({"host": "a.example", "path": "/v2"}))]
+        )
+
+    def testEditOtherContainerRejected(self) -> None:
+        old = self.saved()
+        with self.assertRaises(ValueError):
+            self.manager.save(self.request(container="other", route_id=old))
+
+    def deleteAs(self, key: str, container: str, returncode: int) -> None:
+        result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess([], returncode)
+        with mock.patch.object(traefik.subprocess, "run", return_value=result):
+            self.manager.delete({"id": key, "container": container})
+
+    def testDeleteRequiresOwner(self) -> None:
+        key = self.saved()
+        with self.assertRaises(ValueError):
+            self.deleteAs(key, "other", 0)
+        self.assertIn(key, self.manager.state()["routes"])
+        self.manager.delete({"id": key, "container": "/app"})
+        self.assertEqual(self.manager.state()["routes"], {})
+
+    def testDeleteForeignLiveRouteRejected(self) -> None:
+        key = self.saved()
+        with self.assertRaises(ValueError):
+            self.deleteAs(key, "other", 0)
+        self.assertIn(key, self.manager.state()["routes"])
+
+    def testDeleteOrphanFromOtherTab(self) -> None:
+        key = self.saved()
+        self.deleteAs(key, "other", 1)
+        self.assertEqual(self.manager.state()["routes"], {})
+
+    def testDeleteWhenPodmanErrors(self) -> None:
+        key = self.saved()
+        with self.assertRaises(ValueError):
+            self.deleteAs(key, "other", 125)
+        self.assertIn(key, self.manager.state()["routes"])
+
+    def testDuplicateNamesOwner(self) -> None:
+        self.saved()
+        with self.assertRaisesRegex(ValueError, "app"):
+            self.manager.save(self.request(container="other"))
+
+    def testDisabledDoesNotConnect(self) -> None:
+        self.saved(enabled=False)
+        self.assertEqual(self.connected, [])
+
+    def testPublishRollback(self) -> None:
+        self.saved()
+        original = traefik.atomic_text
+
+        def fail_yml(path: Path, value: str) -> None:
+            if str(path).endswith("cockpit-podman.yml"):
+                raise OSError("disk full")
+            original(path, value)
+
+        with mock.patch.object(traefik, "atomic_text", side_effect=fail_yml), self.assertRaises(OSError):
+            self.manager.save(self.request(host="b.example"))
+        routes = json.loads((self.root / "cockpit-podman-state.json").read_text())["routes"]
+        self.assertEqual(len(routes), 1)
+
+    def failingPublish(self) -> Any:
+        original = traefik.atomic_text
+
+        def fail_yml(path: Path, value: str) -> None:
+            if str(path).endswith("cockpit-podman.yml"):
+                raise OSError("disk full")
+            original(path, value)
+
+        return mock.patch.object(traefik, "atomic_text", side_effect=fail_yml)
+
+    def certificateRequest(self, certificate: str, private_key: str) -> dict[str, Any]:
+        request = self.request(tls="certificate")
+        request["certificate"] = certificate
+        request["private_key"] = private_key
+        return request
+
+    def writePair(self, request: dict[str, Any], key: str, old_id: Optional[str]) -> None:
+        directory = self.root / "certs/cockpit-podman"
+        directory.mkdir(exist_ok=True)
+        (directory / (key + ".crt")).write_text(request["certificate"])
+        (directory / (key + ".key")).write_text(request["private_key"])
+
+    def testPublishFailureRemovesNewCertificate(self) -> None:
+        with mock.patch.object(traefik.Manager, "certificate", side_effect=self.writePair):
+            with self.failingPublish(), self.assertRaises(OSError):
+                self.manager.save(self.certificateRequest("NEW", "NEWKEY"))
+        self.assertEqual(list((self.root / "certs/cockpit-podman").iterdir()), [])
+
+    def testPublishFailureRestoresSameKeyCertificate(self) -> None:
+        with mock.patch.object(traefik.Manager, "certificate", side_effect=self.writePair):
+            self.manager.save(self.certificateRequest("OLD", "OLDKEY"))
+            (key,) = self.manager.state()["routes"]
+            request = self.certificateRequest("NEW", "NEWKEY")
+            request["id"] = key
+            with self.failingPublish(), self.assertRaises(OSError):
+                self.manager.save(request)
+        directory = self.root / "certs/cockpit-podman"
+        self.assertEqual((directory / (key + ".crt")).read_text(), "OLD")
+        self.assertEqual((directory / (key + ".key")).read_text(), "OLDKEY")
+
+    def testPruneCertificates(self) -> None:
+        directory = self.root / "certs/cockpit-podman"
+        directory.mkdir()
+        stale = [directory / ("a" * 24 + ".crt"), directory / ("a" * 24 + ".key")]
+        keep = directory / "operator.pem"
+        for path in (*stale, keep):
+            path.write_text("x")
+        self.saved()
+        for path in stale:
+            self.assertFalse(path.exists())
+        self.assertTrue(keep.exists())
+
+    def testLockSymlinkRefused(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        (self.root / "cockpit-podman.lock").symlink_to(victim)
+        with self.assertRaises(OSError):
+            self.manager.save(self.request())
+        self.assertEqual(victim.read_text(), "keep")
+
+    def testUnsafeCertDirectoryRefused(self) -> None:
+        with mock.patch.object(traefik, "unsafe_directory", return_value="bad"):
+            with self.assertRaisesRegex(ValueError, "bad"):
+                self.manager.save(self.request())
+        self.assertFalse((self.root / "cockpit-podman-state.json").exists())
+
+
+class TestUnsafeDirectory(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def testPrivateDirectoryAccepted(self) -> None:
+        self.root.chmod(0o700)
+        self.assertIsNone(traefik.unsafe_directory(self.root))
+
+    def testGroupWritableRefused(self) -> None:
+        self.root.chmod(0o775)
+        self.assertIn("not writable", traefik.unsafe_directory(self.root) or "")
+
+    def testSymlinkRefused(self) -> None:
+        link = self.root / "link"
+        link.symlink_to(self.root)
+        self.assertIn("symlink", traefik.unsafe_directory(link) or "")
+
+    def testMissingAccepted(self) -> None:
+        self.assertIsNone(traefik.unsafe_directory(self.root / "missing"))
+
+
+class TestRouteBackends(unittest.TestCase):
+    def backend(self, containers: list[dict[str, Any]], *, enabled: bool = True) -> dict[str, Any]:
+        route = traefik.route_value({"host": "app.example", "port": 8080, "enabled": enabled})
+        route["container"] = "app"
+        return traefik.route_backends({"k": route}, containers, "proxy")["k"]  # type: ignore[no-any-return]
+
+    def testMissing(self) -> None:
+        result = self.backend([])
+        self.assertEqual((result["backend"], result["systemd_unit"]), ("missing", ""))
+
+    def testDetached(self) -> None:
+        result = self.backend([{"Names": ["app"], "State": "running", "Networks": ["podman"], "Labels": {}}])
+        self.assertEqual(result["backend"], "detached")
+
+    def testStopped(self) -> None:
+        result = self.backend([{"Names": ["app"], "State": "exited", "Networks": ["proxy"], "Labels": {}}])
+        self.assertEqual(result["backend"], "stopped")
+
+    def testStoppedDisabled(self) -> None:
+        result = self.backend([{"Names": ["app"], "State": "exited", "Networks": [], "Labels": {}}], enabled=False)
+        self.assertEqual(result["backend"], "ok")
+
+    def testSystemdUnit(self) -> None:
+        labels = {"PODMAN_SYSTEMD_UNIT": "app.service"}
+        result = self.backend([{"Names": ["app"], "State": "running", "Networks": ["proxy"], "Labels": labels}])
+        self.assertEqual((result["backend"], result["systemd_unit"]), ("ok", "app.service"))
+
+    def testNullFields(self) -> None:
+        result = self.backend([{"Names": ["app"], "State": "running", "Networks": None, "Labels": None}])
+        self.assertEqual((result["backend"], result["systemd_unit"]), ("detached", ""))
+
+
+if __name__ == "__main__":
+    import testlib
+
+    testlib.test_main()
